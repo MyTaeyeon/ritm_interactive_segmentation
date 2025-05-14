@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Segmentation Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+        .left-panel {
+            flex: 1;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .right-panel {
+            flex: 1;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .image-container {
+            position: relative;
+            margin-top: 20px;
+        }
+        #canvas {
+            max-width: 100%;
+            border: 1px solid #ddd;
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            background-color: #f8f9fa;
+        }
+        .click-info {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <h1>Interactive Segmentation Demo</h1>
+    
+    <div class="container">
+        <div class="left-panel">
+            <h2>Input Image</h2>
+            <input type="file" id="imageInput" accept="image/*">
+            <div class="image-container">
+                <canvas id="canvas"></canvas>
+            </div>
+            <div class="click-info">
+                <p>Left click: Positive point</p>
+                <p>Right click: Negative point</p>
+            </div>
+            <div class="controls">
+                <button id="resetBtn" disabled>Reset Clicks</button>
+                <button id="undoBtn" disabled>Undo Click</button>
+                <button id="finishBtn" disabled>Finish Object</button>
+                <button id="copyBtn" disabled>Copy Image</button>
+                <div class="controls">
+                    <button id="downloadBtn" disabled>Download Mask</button>
+                </div>
+            </div>
+            <div class="status" id="status"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://localhost:8000';
+        let isSessionInitialized = false;
+        let currentImage = null;
+        let clicks = [];
+        let objectCount = 0;
+
+        // Initialize session
+        async function initSession() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/init-session`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        checkpoint: 'hrnet18_cocolvis_itermask_3p',
+                        gpu: 0
+                    })
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    isSessionInitialized = true;
+                    updateStatus('Session initialized successfully');
+                }
+            } catch (error) {
+                updateStatus('Error initializing session: ' + error.message);
+            }
+        }
+
+        // Handle image upload
+        document.getElementById('imageInput').addEventListener('change', async function(e) {
+            if (!isSessionInitialized) {
+                await initSession();
+            }
+            
+            const file = e.target.files[0];
+            if (file) {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const response = await fetch(`${API_BASE_URL}/upload-image`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        currentImage = file;
+                        clicks = [];
+                        objectCount = 0;
+                        loadImage(file);
+                        enableControls();
+                        updateStatus('Image uploaded successfully');
+                    }
+                } catch (error) {
+                    updateStatus('Error uploading image: ' + error.message);
+                }
+            }
+        });
+
+        // Load and display image
+        let originalImageWidth = 0;
+        let originalImageHeight = 0;
+
+        function loadImage(file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const img = new Image();
+                img.onload = function() {
+                    originalImageWidth = img.width;
+                    originalImageHeight = img.height;
+
+                    const canvas = document.getElementById('canvas');
+                    const maxWidth = 800;
+                    const maxHeight = 600;
+                    const scale = Math.min(maxWidth / img.width, maxHeight / img.height);
+                    canvas.width = img.width * scale;
+                    canvas.height = img.height * scale;
+
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+
+        // Handle canvas clicks
+        document.getElementById('canvas').addEventListener('mousedown', async function(e) {
+            if (!currentImage) return;
+
+            const rect = e.target.getBoundingClientRect();
+            const canvas = e.target;
+            
+            // Calculate scale factors
+            const scaleX = canvas.width / originalImageWidth;
+            const scaleY = canvas.height / originalImageHeight;
+            
+            // Convert screen coordinates to image coordinates
+            const screenX = e.clientX - rect.left;
+            const screenY = e.clientY - rect.top;
+            const imageX = Math.round(screenX / scaleX);
+            const imageY = Math.round(screenY / scaleY);
+            
+            // Determine click type
+            let isPositive;
+            if (e.button === 0) {  // Left click
+                isPositive = true;
+            } else if (e.button === 2) {  // Right click
+                isPositive = false;
+            } else {
+                return;  // Ignore other mouse buttons
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/click`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ 
+                        x: imageX, 
+                        y: imageY, 
+                        is_positive: isPositive 
+                    })
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    clicks.push({ x: imageX, y: imageY, isPositive });
+                    updateMask();
+                    enableControls();
+                    updateStatus(`Click added (${data.clicks_count} total)`);
+                }
+            } catch (error) {
+                updateStatus('Error adding click: ' + error.message);
+            }
+        });
+
+        // Download mask
+        document.getElementById('downloadBtn').addEventListener('click', async function() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/get-segmented-image`);
+                const data = await response.json();
+                if (data.status === 'success') {
+                    const link = document.createElement('a');
+                    link.href = data.image;
+                    link.download = 'segmented.png';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                }
+            } catch (error) {
+                updateStatus('Error downloading segmented image: ' + error.message);
+            }
+        });
+
+        // Update mask display
+        async function updateMask() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/get-pure-mask`);
+                const data = await response.json();
+                if (data.status === 'success') {
+                    const maskImg = new Image();
+                    maskImg.onload = () => {
+                        const canvas = document.getElementById('canvas');
+                        const ctx = canvas.getContext('2d');
+
+                        // Vẽ lại ảnh gốc
+                        const reader = new FileReader();
+                        reader.onload = function (e) {
+                            const baseImg = new Image();
+                            baseImg.onload = function () {
+                                const scale = canvas.width / baseImg.width;
+                                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                                ctx.drawImage(baseImg, 0, 0, baseImg.width * scale, baseImg.height * scale);
+
+                                // Vẽ mask đè lên với màu xanh + trong suốt
+                                ctx.globalAlpha = 0.5;
+                                ctx.drawImage(maskImg, 0, 0, canvas.width, canvas.height);
+                                ctx.globalAlpha = 1.0;
+                            };
+                            baseImg.src = reader.result;
+                        };
+                        reader.readAsDataURL(currentImage);
+                    };
+                    maskImg.src = data.image;
+                }
+            } catch (error) {
+                updateStatus('Error updating mask: ' + error.message);
+            }
+        }
+
+
+        // Reset clicks
+        document.getElementById('resetBtn').addEventListener('click', async function() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/reset-clicks`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    clicks = [];
+                    updateMask();
+                    disableControls();
+                    updateStatus('Clicks reset');
+                }
+            } catch (error) {
+                updateStatus('Error resetting clicks: ' + error.message);
+            }
+        });
+
+        // Undo last click
+        document.getElementById('undoBtn').addEventListener('click', async function() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/undo-click`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    clicks.pop();
+                    updateMask();
+                    if (clicks.length === 0) {
+                        disableControls();
+                    }
+                    updateStatus(`Click undone (${data.clicks_count} remaining)`);
+                }
+            } catch (error) {
+                updateStatus('Error undoing click: ' + error.message);
+            }
+        });
+
+        // Finish object
+        document.getElementById('finishBtn').addEventListener('click', async function() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/finish-object`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    objectCount = data.object_count;
+                    clicks = [];
+                    disableControls();
+                    updateStatus(`Object finished (${objectCount} total)`);
+                }
+            } catch (error) {
+                updateStatus('Error finishing object: ' + error.message);
+            }
+        });
+
+        // Copy segmented image to clipboard
+        document.getElementById('copyBtn').addEventListener('click', async function () {
+            try {
+                const response = await fetch(`${API_BASE_URL}/get-segmented-image`);
+                const data = await response.json();
+                if (data.status === 'success') {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = async function () {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = img.width;
+                        canvas.height = img.height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0);
+
+                        canvas.toBlob(async (blob) => {
+                            try {
+                                await navigator.clipboard.write([
+                                    new ClipboardItem({ 'image/png': blob })
+                                ]);
+                                const copyBtn = document.getElementById('copyBtn');
+                                const originalText = copyBtn.textContent;
+                                copyBtn.textContent = 'Copied!';
+                                copyBtn.disabled = true;  // chống spam click nhanh
+                                setTimeout(() => {
+                                    copyBtn.textContent = originalText;
+                                    copyBtn.disabled = false;
+                                }, 2000);
+
+                            } catch (copyError) {
+                                updateStatus('Failed to copy image: ' + copyError.message);
+                            }
+                        }, 'image/png');
+                    };
+                    img.src = data.image;
+                }
+            } catch (error) {
+                updateStatus('Error copying image: ' + error.message);
+            }
+        });
+
+
+        // Helper functions
+        function updateStatus(message) {
+            document.getElementById('status').textContent = message;
+        }
+
+        function enableControls() {
+            document.getElementById('resetBtn').disabled = false;
+            document.getElementById('undoBtn').disabled = clicks.length === 0;
+            document.getElementById('finishBtn').disabled = clicks.length === 0;
+            document.getElementById('downloadBtn').disabled = false;
+            document.getElementById('copyBtn').disabled = false;
+        }
+
+        function disableControls() {
+            document.getElementById('resetBtn').disabled = true;
+            document.getElementById('undoBtn').disabled = true;
+            document.getElementById('finishBtn').disabled = true;
+            document.getElementById('downloadBtn').disabled = true;
+            document.getElementById('copyBtn').disabled = true;
+        }
+
+        // Prevent context menu on right click
+        document.getElementById('canvas').addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+        });
+    </script>
+</body>
+</html> 
